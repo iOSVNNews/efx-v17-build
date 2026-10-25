@@ -1,0 +1,115 @@
+#pragma once
+#include "jvalue.hpp"
+
+namespace zsv {
+// Android 11.0.1 Player::GetDataLabel(SkillCard) table, verified in libUE4.so
+// at file offset 0xcc12ec. Match by parameter label, not by enum ordinal.
+inline constexpr int kZiruSkillParameters[74] = {
+  70,107,71,72,73,108,74,75,135,136,102,116,124,130,140,76,121,77,
+  120,101,78,103,104,109,127,134,79,80,81,114,128,82,110,83,84,119,
+  85,86,98,117,118,122,141,87,88,105,89,90,99,100,138,139,126,129,
+  91,92,93,106,111,112,113,125,137,115,94,123,132,95,131,96,97,133,
+  143,142
+};
+inline bool isZiruSkillId(int id) { return id >= 0 && id < 74; }
+inline int iosSkillId(int id, bool outgoing) {
+  if (outgoing) {
+    if (id == 72) return 25;
+    if (id == 73) return 68;
+    if (!isZiruSkillId(id)) return std::max(0, std::min(73, id));
+    return id + (id >= 25) + (id >= 67);
+  }
+  // iOS wire format -> internal format
+  if (id < 0) return 0;
+  if (id == 25) return 72;
+  if (id == 68) return 73;
+  if (id >= 74) return 71;
+  return id - (id > 25) - (id > 68);
+}
+// iOS 11.1.1 PlayerBase::SetData accepts 147 parameters. Its indices 142/143
+// are skill bits; booster IDs are 144..146 (10 bits each). Ziru 11.0.1 uses
+// 142..144 for boosters, including its newer 149-element record templates.
+// Keep Android/save/oracle data intact and translate only the iOS wire format.
+inline bool adaptIosPlayerData(zj::Value& value, bool outgoing) {
+  bool changed = false;
+  if (value.t == zj::Value::ARR) {
+    for (auto& item : value.a->v) changed |= adaptIosPlayerData(item, outgoing);
+  } else if (value.t == zj::Value::OBJ) {
+    // Verified against dt870 Coach.bin (176-byte records) and native
+    // CoachBase::SetWorkFromPesdb at 0x104b93814: ability_id[3] is the
+    // 10-bit field at bit 10 of the qword at record+16. Two injected coach
+    // templates had this field shifted once too far (12->24, 14->28).
+    // Repair on the wire too, because older squad saves retain the templates.
+    auto cid = value.o->optJSONObject("coach_id");
+    auto abilities = value.o->optJSONArray("ability_id");
+    if (outgoing && cid && abilities && abilities->length() == 4) {
+      int64_t id = cid->optLong("id", 0);
+      if (id == 17609097478250LL && abilities->optInt(3, 0) == 24) { abilities->put(3, 12); changed = true; }
+      if (id == 17608560707469LL && abilities->optInt(3, 0) == 28) { abilities->put(3, 14); changed = true; }
+    }
+    for (const auto& key : value.o->keys()) {
+      auto item = value.o->get(key);
+      if ((key == "additional_skill_id" || key == "skillcard_id_list") && item.t == zj::Value::ARR) {
+        auto skills = zj::Array::make();
+        for (int i = 0; i < item.a->length(); ++i) skills->put(iosSkillId(item.a->getInt(i), outgoing));
+        value.o->put(key, skills);
+        changed = true;
+      } else if ((key == "additional_skill_id" || key == "skill_id") && (item.t == zj::Value::INT || item.t == zj::Value::LONG)) {
+        value.o->put(key, iosSkillId((int)item.n, outgoing));
+        changed = true;
+      } else if ((key == "parameters" || key == "original_parameters") && item.t == zj::Value::ARR) {
+        auto src = item.a;
+        int n = src->length();
+        if (outgoing && n >= 142) {
+          auto dst = zj::Array::make();
+          for (int i = 0; i < 142; ++i) dst->put(src->get(i));
+          dst->put(0)->put(0); // 142 = iOS Skill 68, 143 = iOS Skill 25
+          int b0 = (n == 147) ? src->optInt(144, 0) : ((n > 142) ? src->optInt(142, 0) : 0);
+          int b1 = (n == 147) ? src->optInt(145, 0) : ((n > 143) ? src->optInt(143, 0) : 0);
+          int b2 = (n == 147) ? src->optInt(146, 0) : ((n > 144) ? src->optInt(144, 0) : 0);
+          dst->put(b0)->put(b1)->put(b2);
+
+          auto activateSkill = [&](int sv) {
+            if (sv == 73 || sv == 68) dst->put(142, 1);
+            else if (sv == 72 || sv == 25) dst->put(143, 1);
+            else {
+              int zid = (sv > 25 && sv != 68 && sv != 72 && sv != 73) ? iosSkillId(sv, false) : sv;
+              if (isZiruSkillId(zid)) {
+                int pIdx = kZiruSkillParameters[zid];
+                if (pIdx >= 70 && pIdx < 142) dst->put(pIdx, 1);
+              }
+            }
+          };
+
+          auto ask = value.o->optJSONArray("additional_skill_id");
+          if (ask) {
+            for (int si = 0; si < ask->length(); ++si) activateSkill(ask->optInt(si, -1));
+          }
+          auto skl = value.o->optJSONArray("skillcard_id_list");
+          if (skl) {
+            for (int si = 0; si < skl->length(); ++si) activateSkill(skl->optInt(si, -1));
+          }
+          if (n == 147) {
+            if (src->optInt(142, 0) == 1) dst->put(142, 1);
+            if (src->optInt(143, 0) == 1) dst->put(143, 1);
+          }
+          value.o->put(key, dst);
+          changed = true;
+        } else if (!outgoing && n == 147) {
+          auto dst = zj::Array::make();
+          for (int i = 0; i < 142; ++i) dst->put(src->get(i));
+          dst->put(src->get(144)); // Booster 0
+          dst->put(src->get(145)); // Booster 1 (2nd booster)
+          dst->put(src->get(146)); // Booster 2
+          for (int i = 0; i < 4; ++i) dst->put(0); // Pad to 149
+          value.o->put(key, dst);
+          changed = true;
+        }
+      } else {
+        changed |= adaptIosPlayerData(item, outgoing);
+      }
+    }
+  }
+  return changed;
+}
+}

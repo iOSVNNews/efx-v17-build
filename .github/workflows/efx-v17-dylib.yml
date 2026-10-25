@@ -1,0 +1,53 @@
+# Private build only (no release). Builds both dylibs from the same patched source:
+#   offline: -DEFOOTXI_IOS                  (PES_NO_PUBLIC code is compiled out = offline behaviour)
+#   online : -DEFOOTXI_IOS -DPES_NO_PUBLIC  (pnp online build, "Zero??" watermark)
+name: efx-v17-dylib
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ios-dylib:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        variant: [offline, online]
+    steps:
+      - uses: actions/checkout@v4
+      - name: pinned Python 3.12 iOS SDK
+        run: |
+          curl --fail --location --retry 3 https://github.com/beeware/Python-Apple-support/releases/download/3.12-b11/Python-3.12-iOS-support.b11.tar.gz -o /tmp/python-ios.tar.gz
+          echo '795d2904fbd36e3c49eccbf456bf09fdc569248395c023220704c2cf8be8b7cd  /tmp/python-ios.tar.gz' | shasum -a 256 -c -
+          mkdir -p /tmp/python-ios && tar -xzf /tmp/python-ios.tar.gz -C /tmp/python-ios
+      - name: build ZiruOffline.dylib (${{ matrix.variant }})
+        run: |
+          set -e
+          mkdir -p build
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          DEFS="-DEFOOTXI_IOS"
+          if [ "${{ matrix.variant }}" = online ]; then DEFS="-DEFOOTXI_IOS -DPES_NO_PUBLIC"; fi
+          xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDK" -miphoneos-version-min=15.0 \
+            -std=c++17 -O2 -fobjc-arc -fvisibility=hidden -Wall -Wno-unused \
+            -dynamiclib -install_name @executable_path/Frameworks/ZiruOffline.dylib \
+            $DEFS -F/tmp/python-ios/Python.xcframework/ios-arm64 -framework Python -Wl,-rpath,@loader_path \
+            ios/ZiruOffline.mm ios/ZiruFontPak.mm ios/ZiruWebView.mm core/jvalue.cpp core/codec.cpp core/store.cpp core/server.cpp core/zipread.cpp core/datapack.cpp core/modpack.cpp \
+            -framework Foundation -framework UIKit -framework UniformTypeIdentifiers -framework Security -framework QuartzCore -framework CoreGraphics -framework WebKit \
+            -lz -lsqlite3 -o build/ZiruOffline.dylib 2> build/clang.log || { cat build/clang.log; exit 1; }
+          grep -E "warning:" build/clang.log | head -30 || true
+          codesign -f -s - build/ZiruOffline.dylib
+          otool -L build/ZiruOffline.dylib
+          strings build/ZiruOffline.dylib | grep -q efootxi_panel_ios
+          strings build/ZiruOffline.dylib | grep -q 'efootxi/panel'
+          if [ "${{ matrix.variant }}" = online ]; then
+            strings build/ZiruOffline.dylib | grep -q 'Zero??'
+            ! strings build/ZiruOffline.dylib | grep -q 'Made by iOSVN'
+          fi
+          shasum -a 256 build/ZiruOffline.dylib | tee build/ZiruOffline.dylib.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZiruOffline-${{ matrix.variant }}
+          retention-days: 7
+          path: |
+            build/ZiruOffline.dylib
+            build/ZiruOffline.dylib.sha256
